@@ -744,16 +744,34 @@ unsafe extern "system" fn copy_from(
         }
         return E_INVALIDARG;
     }
+    let (offset, len) = if t.depth > 0 {
+        (at as usize, t.size() as usize)
+    } else {
+        let Some(offset) = k.checked_mul(t.chain.slice_bytes).and_then(|o| o.checked_add(at as usize)) else {
+            return E_INVALIDARG;
+        };
+        (offset, t.chain.slice_bytes)
+    };
+    let Some(start) = src.addr().checked_add(offset) else {
+        return E_INVALIDARG;
+    };
+    if len > isize::MAX as usize || start.checked_add(len).is_none() {
+        return E_INVALIDARG;
+    }
+    crate::hle::kernelx::lazy::ensure(start, len);
+    if !crate::gpu::shader::readable_range(start, len) {
+        return E_INVALIDARG;
+    }
+    let tiled = std::slice::from_raw_parts(src.with_addr(start), len);
     if t.depth > 0 {
-        let linear = t.chain.detile_volume(std::slice::from_raw_parts(src.add(at as usize), t.size() as usize), i);
+        let linear = t.chain.detile_volume(tiled, i);
         for (n, from) in linear.chunks_exact(row).enumerate() {
             let to = n / m.height * slice_stride + n % m.height * pitch;
             std::ptr::copy_nonoverlapping(from.as_ptr(), dst.add(to), row);
         }
         return S_OK;
     }
-    let slice = std::slice::from_raw_parts(src.add(at as usize + k * t.chain.slice_bytes), t.chain.slice_bytes);
-    let linear = t.chain.detile_level(slice, i, k);
+    let linear = t.chain.detile_level(tiled, i, k);
     for y in 0..m.height {
         std::ptr::copy_nonoverlapping(linear[y * row..].as_ptr(), dst.add(y * pitch), row);
     }
@@ -889,6 +907,29 @@ mod tests {
                 }
             }
             rel(comp);
+        }
+    }
+
+    #[test]
+    fn copy_from_rejects_unreadable_source() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS};
+
+        for (description, row_pitch, slice_pitch) in [
+            (desc(64, 32, 1, 1, 28, 0x105), 256, 8192),
+            (desc_3d(16, 8, 4, 1, 28, 0x105), 64, 512),
+        ] {
+            unsafe {
+                let mut comp = std::ptr::null_mut();
+                assert_eq!(XGCreateTextureComputer(description.as_ptr(), &mut comp), S_OK);
+                let source = VirtualAlloc(std::ptr::null(), tex(comp).size() as usize, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+                assert!(!source.is_null());
+                let mut dst = vec![0xa5; 8192];
+                let result = copy_from(comp, dst.as_mut_ptr(), 0, 0, 0, source.cast(), row_pitch, slice_pitch);
+                assert_ne!(VirtualFree(source, 0, MEM_RELEASE), 0);
+                release(comp);
+                assert_eq!(result, E_INVALIDARG);
+                assert!(dst.iter().all(|&byte| byte == 0xa5));
+            }
         }
     }
 
