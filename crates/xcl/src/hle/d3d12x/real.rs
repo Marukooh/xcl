@@ -3336,34 +3336,101 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// DXIL size from which a compute pipeline's driver compile goes to the background
 const BIG_DRIVER_COMPILE: usize = 256 << 10;
 
-/// A counting semaphore: background driver compiles of big programs at once.
+/// A counting semaphore for background driver compiles of big programs:
+/// - demand compiles (`xcl-pso-*`, or a preload worker already promoted by a bind) always run
+///   ahead of speculative preload compiles (`xcl-pso-pre-*`);
+/// - when a demand compile arrives while a `THREAD_PRIORITY_LOWEST` preload worker holds a slot,
+///   that preload worker is boosted to `THREAD_PRIORITY_NORMAL` until it releases the slot.
+struct PreloadHolder {
+    tok: std::sync::Arc<super::pso_async::BoostToken>,
+    boost: Option<super::pso_async::BoostGuard>,
+}
+
+struct SlotState {
+    active: usize,
+    demand_waiting: usize,
+    preload_holders: Vec<PreloadHolder>,
+}
+
 struct Slots {
-    n: Mutex<usize>,
+    state: Mutex<SlotState>,
     cv: std::sync::Condvar,
     most: usize,
 }
 
-struct SlotGuard(&'static Slots);
+struct SlotGuard {
+    slots: &'static Slots,
+    holder_tid: u32,
+}
 
 impl Slots {
-    fn acquire(&'static self) -> SlotGuard {
-        let mut n = self.n.lock().unwrap();
-        while *n >= self.most {
-            n = self.cv.wait(n).unwrap();
+    const fn new(most: usize) -> Self {
+        Self {
+            state: Mutex::new(SlotState { active: 0, demand_waiting: 0, preload_holders: Vec::new() }),
+            cv: std::sync::Condvar::new(),
+            most,
         }
-        *n += 1;
-        SlotGuard(self)
+    }
+
+    fn acquire(&'static self, preload: Option<std::sync::Arc<super::pso_async::BoostToken>>) -> SlotGuard {
+        let mut st = self.state.lock().unwrap();
+        let is_demand = preload.as_ref().is_none_or(|tok| tok.is_boosted());
+        if is_demand {
+            st.demand_waiting += 1;
+            // Boost any low-priority preload worker currently holding a slot so it vacates ASAP
+            for h in &mut st.preload_holders {
+                if h.boost.is_none() {
+                    h.boost = Some(h.tok.boost());
+                }
+            }
+            while st.active >= self.most {
+                st = self.cv.wait(st).unwrap();
+            }
+            st.demand_waiting -= 1;
+            st.active += 1;
+            SlotGuard { slots: self, holder_tid: 0 }
+        } else {
+            let tok = preload.unwrap();
+            while st.active >= self.most || (st.demand_waiting > 0 && !tok.is_boosted()) {
+                st = self.cv.wait(st).unwrap();
+            }
+            st.active += 1;
+            let holder_tid = tok.tid();
+            let boost = (st.demand_waiting > 0).then(|| tok.boost());
+            st.preload_holders.push(PreloadHolder { tok, boost });
+            SlotGuard { slots: self, holder_tid }
+        }
+    }
+
+    fn notify_promoted(&self) {
+        let _g = self.state.lock().unwrap();
+        self.cv.notify_all();
     }
 }
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        *self.0.n.lock().unwrap() -= 1;
-        self.0.cv.notify_one();
+        let removed = {
+            let mut st = self.slots.state.lock().unwrap();
+            st.active -= 1;
+            let removed = if self.holder_tid != 0 {
+                st.preload_holders.iter().position(|h| h.tok.tid() == self.holder_tid).map(|i| st.preload_holders.swap_remove(i))
+            } else {
+                None
+            };
+            self.slots.cv.notify_all();
+            removed
+        };
+        drop(removed);
     }
 }
 
-static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+static BIG_COMPILES: Slots = Slots::new(1);
+
+/// Wake `BIG_COMPILES` waiters when a preload worker is promoted to demand priority.
+pub(crate) fn notify_big_compiles() {
+    BIG_COMPILES.notify_promoted();
+}
 
 /// Before a big driver compile in the background: until 3 GB of commit are free (each takes
 /// ~1.5 GB; the title loading next to it must not run out – no minute's grace as for DXC).
@@ -3430,7 +3497,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     let started = std::time::Instant::now();
     // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
     let _slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
-        let slot = BIG_COMPILES.acquire();
+        let slot = BIG_COMPILES.acquire(super::pso_async::current_preload_token());
         wait_for_commit();
         slot
     });
@@ -5763,5 +5830,82 @@ mod console_format_query_tests {
             let pc = unsafe { dev.GetResourceAllocationInfo(0, &[d]) };
             assert!(pc.SizeInBytes != u64::MAX && pc.SizeInBytes >= 1920 * 1080 * 4 && pc.Alignment > 0, "PC {format} as {}: {:#x}", d.Format.0, pc.SizeInBytes);
         }
+    }
+
+    #[test]
+    fn big_compile_slots_boost_preload_holder_and_run_demand_first() {
+        use std::sync::mpsc;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetThreadPriority, OpenThread, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL,
+            THREAD_QUERY_LIMITED_INFORMATION,
+        };
+        static TEST_SLOTS: Slots = Slots::new(1);
+        let prio_of = |tid: u32| unsafe {
+            let h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, tid);
+            assert!(!h.is_null());
+            let p = GetThreadPriority(h);
+            CloseHandle(h);
+            p
+        };
+
+        let (a_ready_tx, a_ready_rx) = mpsc::channel();
+        let (a_release_tx, a_release_rx) = mpsc::channel();
+        let (a_done_tx, a_done_rx) = mpsc::channel();
+        let (order_tx, order_rx) = mpsc::channel();
+
+        // Thread A: low-priority preload worker acquires the single slot
+        let ta = std::thread::spawn(move || {
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
+            let tok = super::super::pso_async::BoostToken::for_current_thread();
+            let tid = tok.tid();
+            let guard = TEST_SLOTS.acquire(Some(tok));
+            a_ready_tx.send(tid).unwrap();
+            a_release_rx.recv().unwrap();
+            drop(guard);
+            // Keep thread alive briefly so main can read its restored OS priority
+            a_done_tx.send(()).unwrap();
+            a_release_rx.recv().unwrap();
+        });
+        let a_tid = a_ready_rx.recv().unwrap();
+        assert_eq!(prio_of(a_tid), THREAD_PRIORITY_LOWEST);
+
+        // Thread B: another preload worker queues behind A first
+        let order_b = order_tx.clone();
+        let (b_wait_tx, b_wait_rx) = mpsc::channel();
+        let tb = std::thread::spawn(move || {
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
+            let tok = super::super::pso_async::BoostToken::for_current_thread();
+            b_wait_tx.send(()).unwrap();
+            let _g = TEST_SLOTS.acquire(Some(tok));
+            order_b.send("preload").unwrap();
+        });
+        b_wait_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // Thread C: demand worker arrives later -> must boost A to NORMAL and run BEFORE B
+        let order_c = order_tx;
+        let tc = std::thread::spawn(move || {
+            let _g = TEST_SLOTS.acquire(None);
+            order_c.send("demand").unwrap();
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while prio_of(a_tid) != THREAD_PRIORITY_NORMAL {
+            assert!(std::time::Instant::now() < deadline, "preload holder A was not boosted by waiting demand compile");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        // Release A: C (demand) must run before B (preload), and A returns to LOWEST
+        a_release_tx.send(()).unwrap();
+        a_done_rx.recv().unwrap();
+        assert_eq!(prio_of(a_tid), THREAD_PRIORITY_LOWEST, "holder A priority restored after releasing slot");
+        assert_eq!(order_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), "demand");
+        assert_eq!(order_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), "preload");
+
+        a_release_tx.send(()).unwrap();
+        ta.join().unwrap();
+        tb.join().unwrap();
+        tc.join().unwrap();
     }
 }
