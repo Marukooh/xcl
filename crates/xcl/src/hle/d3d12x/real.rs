@@ -3375,7 +3375,18 @@ impl Slots {
         }
     }
 
+    fn limit(&self) -> usize {
+        if std::ptr::eq(self, &BIG_COMPILES) {
+            static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            return *N.get_or_init(|| {
+                std::env::var("XCL_BIG_COMPILES").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or(self.most)
+            });
+        }
+        self.most
+    }
+
     fn acquire(&'static self, preload: Option<std::sync::Arc<super::pso_async::BoostToken>>) -> SlotGuard {
+        let most = self.limit();
         let mut st = self.state.lock().unwrap();
         let is_demand = preload.as_ref().is_none_or(|tok| tok.is_boosted());
         if is_demand {
@@ -3386,7 +3397,7 @@ impl Slots {
                     h.boost = Some(h.tok.boost());
                 }
             }
-            while st.active >= self.most {
+            while st.active >= most {
                 st = self.cv.wait(st).unwrap();
             }
             st.demand_waiting -= 1;
@@ -3394,7 +3405,7 @@ impl Slots {
             SlotGuard { slots: self, holder_tid: 0 }
         } else {
             let tok = preload.unwrap();
-            while st.active >= self.most || (st.demand_waiting > 0 && !tok.is_boosted()) {
+            while st.active >= most || (st.demand_waiting > 0 && !tok.is_boosted()) {
                 st = self.cv.wait(st).unwrap();
             }
             st.active += 1;

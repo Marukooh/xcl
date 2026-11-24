@@ -486,8 +486,6 @@ mod used_tests {
         released(unknown);
     }
 
-<<<<<<< HEAD
-=======
     fn thread_priority_of(tid: u32) -> i32 {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{GetThreadPriority, OpenThread, THREAD_QUERY_LIMITED_INFORMATION};
@@ -613,16 +611,27 @@ pub fn resolve(pso: usize) -> usize {
 /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
-    resolve_wait_for(pso, wait_budget())
+    let Some(p) = entry(pso) else { return pso };
+    p.note_use();
+    let budget = if p.compute { wait_budget() } else { gfx_wait_budget().or_else(wait_budget) };
+    if let Some(budget) = budget {
+        return resolve_within(&p, pso, budget);
+    }
+    resolve_with(p, pso)
 }
 
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
+#[cfg(test)]
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget);
     }
+    resolve_with(p, pso)
+}
+
+fn resolve_with(p: Arc<Pending>, pso: usize) -> usize {
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
         complete(&p, job());
@@ -648,6 +657,12 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
 fn wait_budget() -> Option<std::time::Duration> {
     static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
     *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
+}
+
+/// Optional separate wait budget for graphics pipelines (`XCL_GFX_PSO_WAIT_MS`).
+fn gfx_wait_budget() -> Option<std::time::Duration> {
+    static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *B.get_or_init(|| std::env::var("XCL_GFX_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
 }
 
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
