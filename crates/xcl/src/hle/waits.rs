@@ -312,14 +312,19 @@ fn waits_over(min_secs: f64) -> Vec<String> {
     out
 }
 
-/// For a thread dump: the title's threads that have waited `LONG_WAIT_SECS` or more, what on,
-/// where the objects were made and who last signaled them. Empty when off.
+/// For a thread dump: the size of the tracer's own tables, then the title's threads that have
+/// waited `LONG_WAIT_SECS` or more, what on, where the objects were made and who last
+/// signaled them. Empty when off.
 pub fn long_waits() -> Vec<String> {
-    if enabled() {
-        waits_over(LONG_WAIT_SECS)
-    } else {
-        Vec::new()
+    if !enabled() {
+        return Vec::new();
     }
+    let size = |n: Option<usize>| n.map_or_else(|| "busy".to_string(), |n| n.to_string());
+    let handles = objects().try_lock().ok().map(|m| m.len());
+    let waiting = waits().try_lock().ok().map(|m| m.len());
+    let mut out = vec![format!("tracer tables: {} handles, {} threads waiting", size(handles), size(waiting))];
+    out.extend(waits_over(LONG_WAIT_SECS));
+    out
 }
 
 #[cfg(test)]
