@@ -243,7 +243,9 @@ struct State {
     /// ring of async upload command allocators + lists
     slots: Vec<UploadSlot>,
     next_slot: usize,
-    /// dedicated readback staging buffer + command allocator / list
+    /// dedicated readback queue + staging buffer + command allocator / list
+    /// (separate from `queue` so waiting on a title queue never blocks sparse uploads)
+    rb_queue: Option<ID3D12CommandQueue>,
     readback: Option<(ID3D12Resource, *mut u8)>,
     rb_alloc: ID3D12CommandAllocator,
     rb_list: ID3D12GraphicsCommandList,
@@ -507,6 +509,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     }
     let made = (|| -> windows::core::Result<State> {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
+        let rb_queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
@@ -525,6 +528,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
         let _ = rb_list.SetName(windows::core::w!("xcl sparse readback list"));
         let _ = rb_alloc.SetName(windows::core::w!("xcl sparse readback allocator"));
         let _ = queue.SetName(windows::core::w!("xcl sparse queue"));
+        let _ = rb_queue.SetName(windows::core::w!("xcl sparse readback queue"));
         Ok(State {
             dev: dev.clone(),
             queue,
@@ -550,6 +554,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             zero_buf: None,
             slots,
             next_slot: 0,
+            rb_queue: Some(rb_queue),
             readback: None,
             rb_alloc,
             rb_list,
@@ -808,13 +813,28 @@ impl State {
     }
 
     #[inline]
-    unsafe fn wait_for(&self, target: u64) {
+    unsafe fn wait_rb_ms(&self, target: u64, ms: u32) -> bool {
+        if target == 0 || self.rb_fence.GetCompletedValue() >= target {
+            return true;
+        }
+        let _ = self.rb_fence.SetEventOnCompletion(target, self.event);
+        windows::Win32::System::Threading::WaitForSingleObject(self.event, ms);
+        self.rb_fence.GetCompletedValue() >= target
+    }
+
+    #[inline]
+    unsafe fn wait_for_ms(&self, target: u64, ms: u32) -> bool {
         if target == 0 || self.fence.GetCompletedValue() >= target {
-            return;
+            return true;
         }
         let _ = self.fence.SetEventOnCompletion(target, self.event);
-        windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
-        if self.fence.GetCompletedValue() < target {
+        windows::Win32::System::Threading::WaitForSingleObject(self.event, ms);
+        self.fence.GetCompletedValue() >= target
+    }
+
+    #[inline]
+    unsafe fn wait_for(&self, target: u64) {
+        if !self.wait_for_ms(target, 5000) {
             crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
         }
     }
@@ -835,16 +855,42 @@ impl State {
         }
     }
 
-    /// Acquire the next upload command slot, waiting only if that slot's previous submission is
-    /// still executing on the GPU, then reset its allocator and list.
+    /// Acquire the next upload command slot, waiting only briefly if all slots are still
+    /// executing (e.g. behind a `wait-before-signal` GPU wait), growing up to 32 slots if needed.
     unsafe fn begin_slot(&mut self) -> usize {
-        let idx = self.next_slot;
-        self.next_slot = (self.next_slot + 1) % self.slots.len();
-        let fv = self.slots[idx].fence_val;
-        if fv > 0 && self.fence.GetCompletedValue() < fv {
-            self.wait_for(fv);
-            self.reclaim_ring();
+        let completed = self.fence.GetCompletedValue();
+        if let Some(idx) = self.slots.iter().position(|s| s.fence_val == 0 || s.fence_val <= completed) {
+            self.next_slot = (idx + 1) % self.slots.len();
+            let slot = &self.slots[idx];
+            let _ = slot.alloc.Reset();
+            let _ = slot.list.Reset(&slot.alloc, None);
+            return idx;
         }
+        let idx = self.next_slot;
+        let fv = self.slots[idx].fence_val;
+        if self.wait_for_ms(fv, 50) {
+            self.reclaim_ring();
+            self.next_slot = (idx + 1) % self.slots.len();
+            let slot = &self.slots[idx];
+            let _ = slot.alloc.Reset();
+            let _ = slot.list.Reset(&slot.alloc, None);
+            return idx;
+        }
+        if self.slots.len() < 32 {
+            if let Ok(alloc) = self.dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) {
+                let alloc: ID3D12CommandAllocator = alloc;
+                if let Ok(list) = self.dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None) {
+                    let list: ID3D12GraphicsCommandList = list;
+                    let _ = list.SetName(windows::core::w!("xcl sparse upload list"));
+                    let _ = alloc.SetName(windows::core::w!("xcl sparse upload allocator"));
+                    self.slots.push(UploadSlot { alloc, list, fence_val: 0 });
+                    return self.slots.len() - 1;
+                }
+            }
+        }
+        self.next_slot = (idx + 1) % self.slots.len();
+        self.wait_for(fv);
+        self.reclaim_ring();
         let slot = &self.slots[idx];
         let _ = slot.alloc.Reset();
         let _ = slot.list.Reset(&slot.alloc, None);
@@ -1009,14 +1055,20 @@ impl State {
                 if s.rb_list.Close().is_ok() {
                     if let Ok(l) = s.rb_list.cast::<ID3D12CommandList>() {
                         super::title_textures::own_work(|| {
-                            s.queue.ExecuteCommandLists(&[Some(l)]);
+                            s.rb_queue.as_ref().unwrap_or(&s.queue).ExecuteCommandLists(&[Some(l)]);
                         });
                     }
                 }
-                s.signal();
-                s.rb_last_fence = s.value;
-                s.wait_for(s.value);
-                s.reclaim_ring();
+                s.rb_value += 1;
+                let fv = s.rb_value;
+                let _ = s.rb_queue.as_ref().unwrap_or(&s.queue).Signal(&s.rb_fence, fv);
+                s.rb_last_fence = fv;
+                if !s.wait_rb_ms(fv, 50) {
+                    // Readback queue is behind a wait-before-signal; don't block the submit thread or copy stale bytes.
+                    pending.clear();
+                    *used = 0;
+                    return;
+                }
             }
             for &(dst, off, len) in pending.iter() {
                 // copy only committed (non-hole) bytes
@@ -1060,7 +1112,9 @@ impl State {
                 let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
                 let chunk = (n - done).min(READBACK_STAGING - used).min(to_tile_end).min(to_win_end);
                 if !open {
-                    self.wait_for(self.rb_last_fence);
+                    if !self.wait_rb_ms(self.rb_last_fence, 50) {
+                        return;
+                    }
                     let _ = self.rb_alloc.Reset();
                     let _ = self.rb_list.Reset(&self.rb_alloc, None);
                     open = true;
@@ -1245,7 +1299,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     s.rb_value += 1;
     let v = s.rb_value;
     if queue.Signal(&s.rb_fence, v).is_ok() {
-        let _ = s.queue.Wait(&s.rb_fence, v);
+        let _ = s.rb_queue.as_ref().unwrap_or(&s.queue).Wait(&s.rb_fence, v);
     }
     s.readback_ranges(&merged);
 }
@@ -1299,6 +1353,11 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     }
     if !dirty_runs.is_empty() {
         s.upload_dirty(&dirty_runs);
+    }
+    if let Some(rq) = &s.rb_queue {
+        if s.value > 0 {
+            let _ = rq.Wait(&s.fence, s.value);
+        }
     }
     s.readback_ranges(&[(va, len)]);
 }
@@ -1674,6 +1733,7 @@ mod tests {
                 zero_buf: None,
                 slots: Vec::new(),
                 next_slot: 0,
+                rb_queue: None,
                 readback: None,
                 rb_alloc,
                 rb_list,
@@ -1880,6 +1940,7 @@ mod tests {
                 zero_buf: None,
                 slots: Vec::new(),
                 next_slot: 0,
+                rb_queue: None,
                 readback: None,
                 rb_alloc,
                 rb_list,
@@ -1975,6 +2036,7 @@ mod tests {
                 zero_buf: None,
                 slots: Vec::new(),
                 next_slot: 0,
+                rb_queue: None,
                 readback: None,
                 rb_alloc,
                 rb_list,

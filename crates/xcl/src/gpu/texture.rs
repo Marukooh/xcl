@@ -294,11 +294,20 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     up.value += 1;
     let copy_error = |e| format!("texture copy: {e}");
     queue.Signal(&up.fence, up.value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
-    if let Err(e) = fence::wait(&up.fence, up.value, dev, None, 10_000) {
-        // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
-        // uploader next time) – freeing them under the GPU removed the device
-        std::mem::forget(up);
-        return Err(copy_error(e));
+    match fence::wait(&up.fence, up.value, dev, None, 500) {
+        Ok(()) => {}
+        Err(fence::FenceError::Timeout(_)) if dev.GetDeviceRemovedReason().is_ok() => {
+            // The queue is likely behind a wait-before-signal on single_queue; keep the staging
+            // buffer alive and let the submit thread proceed to submit the producer queue.
+            std::mem::forget(up);
+            return Ok(failed);
+        }
+        Err(e) => {
+            // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
+            // uploader next time) – freeing them under the GPU removed the device
+            std::mem::forget(up);
+            return Err(copy_error(e));
+        }
     }
     put_back(key, up);
     Ok(failed)

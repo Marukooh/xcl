@@ -715,7 +715,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--precompile") {
         let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
         let pipelines = args.iter().any(|a| a == "--pipelines");
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
+        return precompile(&input, opt("--from").unwrap_or(0), opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
@@ -834,7 +834,7 @@ impl Pipelines {
     }
 }
 
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, t0: std::time::Instant) -> i32 {
+fn precompile(input: &Input, from: usize, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, t0: std::time::Instant) -> i32 {
     let pipelines = if pipelines {
         match Pipelines::new() {
             Ok(p) => Some(p),
@@ -848,7 +848,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     };
     let pipelines = pipelines.as_ref();
     let n = input.len().min(limit);
-    let next = AtomicUsize::new(0);
+    let next = AtomicUsize::new(from.min(n));
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     // the compiles run on the DXC pool; these threads translate and keep it fed

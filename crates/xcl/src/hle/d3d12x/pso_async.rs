@@ -379,7 +379,11 @@ fn preload() -> Option<&'static Preload> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
+        let n = std::env::var("XCL_PSO_PRELOAD_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4));
         for k in 0..n {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
                 unsafe {
@@ -613,11 +617,58 @@ pub fn resolve(pso: usize) -> usize {
 pub fn resolve_wait(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
-    let budget = if p.compute { wait_budget() } else { gfx_wait_budget().or_else(wait_budget) };
-    if let Some(budget) = budget {
+    if !p.compute {
+        if let Some(budget) = gfx_wait_budget().or_else(wait_budget) {
+            return resolve_within(&p, pso, budget);
+        }
+        return resolve_with(p, pso);
+    }
+    if let Some(per_sec) = compute_budget_per_sec() {
+        return resolve_with_thread_budget(&p, pso, per_sec);
+    }
+    if let Some(budget) = wait_budget() {
         return resolve_within(&p, pso, budget);
     }
     resolve_with(p, pso)
+}
+
+fn compute_budget_per_sec() -> Option<std::time::Duration> {
+    static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("XCL_PSO_BUDGET_MS_PER_SEC")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(std::time::Duration::from_millis)
+    })
+}
+
+fn resolve_with_thread_budget(p: &Arc<Pending>, pso: usize, per_sec: std::time::Duration) -> usize {
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+    thread_local! {
+        static WINDOW: RefCell<Option<(Instant, Duration)>> = const { RefCell::new(None) };
+    }
+    let rem = WINDOW.with(|w| {
+        let mut w = w.borrow_mut();
+        let now = Instant::now();
+        match &mut *w {
+            Some((start, rem)) if now.saturating_duration_since(*start) < Duration::from_secs(1) => *rem,
+            slot => {
+                *slot = Some((now, per_sec));
+                per_sec
+            }
+        }
+    });
+    let t0 = Instant::now();
+    let res = resolve_within(p, pso, rem);
+    let used = t0.elapsed();
+    WINDOW.with(|w| {
+        if let Some((_, rem)) = &mut *w.borrow_mut() {
+            *rem = rem.saturating_sub(used);
+        }
+    });
+    res
 }
 
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
